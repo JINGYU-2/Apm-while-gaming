@@ -1,0 +1,88 @@
+import threading
+import serial
+import torch
+import numpy as np
+from torch import nn
+import time
+import keyboard
+import copy
+
+from ads import Model
+
+NUM_CLASSES = 4
+NUM_FEATURES = 3  
+
+# Global variable to store array
+newarr = []
+oldarr = []
+# Function to send data to FPGA via UART
+def send_data_to_fpga(data, ser):
+    ser.write(data.encode('utf-8'))  
+    print(f"Sent to FPGA: {data.encode('utf-8')}")
+    time.sleep(0.01)
+
+# Serial read function, skip 35 samples
+def read_from_fpga(ser, sample_skip=35):
+    global newarr
+    global oldarr
+    z = 0
+    while True:
+        data = ser.readline().decode('utf-8').strip()
+        z += 1
+        if z != sample_skip:  # Skip some samples 
+            continue
+        z = 0  
+
+        if data:
+            value = int(data)
+            newarr.append(value)
+            if len(newarr) == 50:  
+                      
+                oldarr = copy.deepcopy(newarr)
+                newarr.clear()
+          
+def process_data_and_send(ser, model, arr):
+    if len(arr) < 50:
+        return  # Wait for emough data
+
+    
+    res = np.zeros(3)
+    res[0] = np.std(arr)
+    filtered_arr = np.array([x for x in arr if x <= 100])
+    abs_diff = np.sum(np.abs(np.diff(filtered_arr)))
+    res[2] = abs_diff
+    res[1] = sum(1 for x in arr if x > 50)
+
+    # Create tensor from array
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    testsample = torch.from_numpy(res).type(torch.float32).unsqueeze(0).to(device)
+
+    model.eval()
+    test_logits = model(testsample)
+    test_pred = torch.softmax(test_logits, dim=1).argmax(dim=1)
+    result = test_pred.item()
+
+    if result == 1:
+        if keyboard.read_event():
+            send_data_to_fpga('2', ser)
+
+        
+  
+
+if __name__ == "__main__":
+    # Load model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = Model(input_features=3, output_features=4, hidden_units=16).to(device)
+    model.load_state_dict(torch.load("modelF.pth"))
+
+    ser = serial.Serial('COM6', 9600, timeout=1)  
+
+    # reading from the FPGA
+    read_thread = threading.Thread(target=read_from_fpga, args=(ser,))
+    read_thread.daemon = True  
+    read_thread.start()
+
+   
+    while True:
+        process_data_and_send(ser, model, oldarr)
+
